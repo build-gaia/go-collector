@@ -1,6 +1,6 @@
 module chronos.dev/collector/sdk/go
 
-go 1.26.5
+go 1.25.0
 
 require (
 	github.com/google/pprof v0.0.0-20260825002013-8a176773c324
