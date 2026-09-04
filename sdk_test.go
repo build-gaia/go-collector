@@ -45,6 +45,26 @@ func TestRedactMasksSensitiveKeys(t *testing.T) {
 	require.True(t, strings.HasSuffix(out["Authorization"], "oken"))
 }
 
+func TestRedactCredentialsMasksSecretHalfOfMintedKeys(t *testing.T) {
+	// The mint endpoint's response body: the one payload in the estate that
+	// carries a usable ingest key, and a body has no key name to redact by.
+	body := `{"tokenId":"token_AbC-123456","secret":"token_AbC-123456.s3cr3tS3cr3tS3cr3tS3cr3t","displayName":"forwarder"}`
+	out := redact.Credentials(body)
+
+	require.NotContains(t, out, "s3cr3tS3cr3tS3cr3tS3cr3t")
+	// The id half survives, so an incident can name WHICH key leaked.
+	require.Contains(t, out, "token_AbC-123456.*********")
+	require.Contains(t, out, `"displayName":"forwarder"`)
+}
+
+func TestRedactCredentialsLeavesOrdinaryBodiesAlone(t *testing.T) {
+	body := `{"message":"no credential here","count":3}`
+	require.Equal(t, body, redact.Credentials(body))
+	// A token id on its own is an identifier, not a secret, and must not be
+	// mangled — half a masked value reads as a redaction that failed.
+	require.Equal(t, `{"tokenId":"token_AbC-123456"}`, redact.Credentials(`{"tokenId":"token_AbC-123456"}`))
+}
+
 func TestConfigDisabledWithoutIdentity(t *testing.T) {
 	t.Setenv("CHRONOS_ENABLED", "1")
 	t.Setenv("CHRONOS_ORGANISATION_ID", "")

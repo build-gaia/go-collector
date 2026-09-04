@@ -56,7 +56,7 @@ func (c *Client) Handler(next http.Handler) http.Handler {
 				body, truncated := readBodyCap(r.Body, c.cfg.HTTPMaxBody)
 				_ = r.Body.Close()
 				r.Body = io.NopCloser(bytes.NewReader(body))
-				span.SetAttribute("http.request.body", string(body))
+				span.SetAttribute("http.request.body", bodyText(string(body), c.cfg))
 				span.SetAttribute("http.request.body.size", attrInt(len(body)))
 				if truncated {
 					span.SetAttribute("http.request.body.truncated", "true")
@@ -80,7 +80,7 @@ func (c *Client) Handler(next http.Handler) http.Handler {
 			if c.cfg.HTTPCapture {
 				captureResponseExchange(span, rw.Header(), c.cfg)
 				if c.cfg.HTTPCaptureBodies && len(rw.body) > 0 {
-					span.SetAttribute("http.response.body", string(rw.body))
+					span.SetAttribute("http.response.body", bodyText(string(rw.body), c.cfg))
 					span.SetAttribute("http.response.body.size", attrInt(len(rw.body)))
 					if rw.bodyTruncated {
 						span.SetAttribute("http.response.body.truncated", "true")
@@ -212,6 +212,18 @@ func requestHost(r *http.Request) string {
 		return strings.TrimSpace(strings.Split(host, ",")[0])
 	}
 	return r.Host
+}
+
+// bodyText is a captured body as it may be STORED.
+//
+// A body is the one captured value with no key to redact by — see
+// [redact.Credentials]. Gated on the same HTTPRedact switch as header masking, so
+// a service debugging locally with redaction off still sees exactly what it sent.
+func bodyText(body string, cfg Config) string {
+	if !cfg.HTTPRedact {
+		return body
+	}
+	return redact.Credentials(body)
 }
 
 func captureRequestExchange(span *Span, r *http.Request, cfg Config) {
