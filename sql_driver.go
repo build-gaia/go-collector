@@ -115,7 +115,7 @@ func (c *sqlConn) PrepareContext(ctx context.Context, query string) (driver.Stmt
 
 func (c *sqlConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if e, ok := c.parent.(driver.ExecerContext); ok {
-		_, op := c.drv.startSQLSpan(ctx, query, c.target)
+		_, op := c.drv.startSQLSpan(ctx, query, c.target, namedParams(args))
 		res, err := e.ExecContext(ctx, query, args)
 		if errors.Is(err, driver.ErrSkip) {
 			abandonSpan(op)
@@ -129,7 +129,7 @@ func (c *sqlConn) ExecContext(ctx context.Context, query string, args []driver.N
 		if err != nil {
 			return nil, err
 		}
-		_, op := c.drv.startSQLSpan(ctx, query, c.target)
+		_, op := c.drv.startSQLSpan(ctx, query, c.target, namedParams(args))
 		res, err := e.Exec(query, vals)
 		if errors.Is(err, driver.ErrSkip) {
 			abandonSpan(op)
@@ -143,7 +143,7 @@ func (c *sqlConn) ExecContext(ctx context.Context, query string, args []driver.N
 
 func (c *sqlConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if q, ok := c.parent.(driver.QueryerContext); ok {
-		_, op := c.drv.startSQLSpan(ctx, query, c.target)
+		_, op := c.drv.startSQLSpan(ctx, query, c.target, namedParams(args))
 		rows, err := q.QueryContext(ctx, query, args)
 		if errors.Is(err, driver.ErrSkip) {
 			abandonSpan(op)
@@ -157,7 +157,7 @@ func (c *sqlConn) QueryContext(ctx context.Context, query string, args []driver.
 		if err != nil {
 			return nil, err
 		}
-		_, op := c.drv.startSQLSpan(ctx, query, c.target)
+		_, op := c.drv.startSQLSpan(ctx, query, c.target, namedParams(args))
 		rows, err := q.Query(query, vals)
 		if errors.Is(err, driver.ErrSkip) {
 			abandonSpan(op)
@@ -212,21 +212,21 @@ func (s *sqlStmt) Close() error  { return s.parent.Close() }
 func (s *sqlStmt) NumInput() int { return s.parent.NumInput() }
 
 func (s *sqlStmt) Exec(args []driver.Value) (driver.Result, error) {
-	_, op := s.drv.startSQLSpan(context.Background(), s.query, s.target)
+	_, op := s.drv.startSQLSpan(context.Background(), s.query, s.target, valueParams(args))
 	res, err := s.parent.Exec(args)
 	finishSQLSpan(op, err)
 	return res, err
 }
 
 func (s *sqlStmt) Query(args []driver.Value) (driver.Rows, error) {
-	_, op := s.drv.startSQLSpan(context.Background(), s.query, s.target)
+	_, op := s.drv.startSQLSpan(context.Background(), s.query, s.target, valueParams(args))
 	rows, err := s.parent.Query(args)
 	finishSQLSpan(op, err)
 	return rows, err
 }
 
 func (s *sqlStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
-	_, op := s.drv.startSQLSpan(ctx, s.query, s.target)
+	_, op := s.drv.startSQLSpan(ctx, s.query, s.target, namedParams(args))
 	var (
 		res driver.Result
 		err error
@@ -247,7 +247,7 @@ func (s *sqlStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (dr
 }
 
 func (s *sqlStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
-	_, op := s.drv.startSQLSpan(ctx, s.query, s.target)
+	_, op := s.drv.startSQLSpan(ctx, s.query, s.target, namedParams(args))
 	var (
 		rows driver.Rows
 		err  error

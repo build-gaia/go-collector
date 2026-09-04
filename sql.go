@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -140,7 +141,7 @@ func (d *sqlDriver) target(dsn string) connTarget {
 	return target
 }
 
-func (d *sqlDriver) startSQLSpan(ctx context.Context, query string, target connTarget) (context.Context, *sqlOp) {
+func (d *sqlDriver) startSQLSpan(ctx context.Context, query string, target connTarget, params paramList) (context.Context, *sqlOp) {
 	op := &sqlOp{drv: d, ctx: ctx, verb: sqlVerb(query), start: time.Now()}
 	// SQL spans must nest under an HTTP/job (or manual) root. Emitting root
 	// traces per statement floods the trace list and hides real entrypoints.
@@ -160,6 +161,7 @@ func (d *sqlDriver) startSQLSpan(ctx context.Context, query string, target connT
 	span.SetAttribute("db.statement", stmt)
 	span.SetAttribute("db.query.text", stmt)
 	setTargetAttributes(span, target)
+	setParameterAttributes(span, params)
 	op.span = span
 	op.ctx = ctx
 	return ctx, op
@@ -234,5 +236,19 @@ func setTargetAttributes(span *Span, target connTarget) {
 	}
 	if target.driver != "" {
 		span.SetAttribute("db.driver", target.driver)
+	}
+}
+
+// setParameterAttributes stamps the values the statement actually ran with. The
+// count is written even when the rendered list is empty so a reader can tell a
+// statement that bound nothing from one whose values were dropped.
+func setParameterAttributes(span *Span, params paramList) {
+	count := params.len()
+	if count == 0 {
+		return
+	}
+	span.SetAttribute("db.parameters.count", strconv.Itoa(count))
+	if rendered := boundedParametersJSON(params); rendered != "" {
+		span.SetAttribute("db.parameters", rendered)
 	}
 }

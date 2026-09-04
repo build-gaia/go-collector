@@ -41,6 +41,40 @@ shortened against the main module — a frame in
 (The pprof mapping file is not used for this: a statically linked Go binary has one
 mapping, so every application frame would carry an identical module name.)
 
+## Kafka (and other messaging)
+
+`contrib/sarama` wraps IBM/sarama so a publish and a consume are spans:
+
+```go
+// producer — one PUBLISH <topic> span, and the trace stamped onto the message
+traced := chronossarama.WrapSyncProducer(producer, nil, brokers)
+partition, offset, err := traced.SendMessageContext(ctx, message)
+
+// consumer — one PROCESS <topic> span per message, parented onto that publish
+handler := chronossarama.WrapConsumerGroupHandler(myHandler, nil, groupID)
+```
+
+A separate module (`chronos.dev/collector/sdk/go/contrib/sarama`), for the reason
+dd-trace-go splits its contribs: a service that speaks no Kafka should not compile
+sarama to get HTTP tracing.
+
+The spans carry the OTel messaging attributes — `messaging.system`,
+`messaging.operation`, `messaging.destination.name`, partition, offset, body size,
+consumer group. Those are not decoration: the desktop's **Producers** view joins
+`messaging.destination.name` to a stream and reads the direction off
+`messaging.operation`, so instrumenting a service is what turns that view's "not
+instrumented" into a named writer, and what flips a dependency-graph edge from
+uninstrumented to instrumented.
+
+The producer writes the active span as a W3C `traceparent` message header and the
+consumer reads it back, so work caused by a message is a child of the publish that
+caused it — across processes and across languages, since the PHP collector reads
+the same header. A message without the header starts its own trace rather than
+being dropped.
+
+For a transport with no wrapper yet, `client.RecordMessaging` / `StartMessagingSpan`
+in the core SDK take the same attributes with no Kafka types involved.
+
 ## Profile types
 
 The same five sample types the PHP sampler produces, plus lock contention. One series
@@ -152,6 +186,31 @@ wrong host mints a data source an operator then has to disown.
 
 **The password is never held.** It is read only to find where the user name ends,
 and is asserted absent from every emitted field in `sql_dsn_test.go`.
+
+## SQL bound parameters
+
+A statement span also carries the values it ran with, on the same two attributes
+the PHP collector writes:
+
+| Attribute | Value |
+| --- | --- |
+| `db.parameters` | JSON array of the bound values as strings, in ordinal order |
+| `db.parameters.count` | How many were bound, **before** capping |
+
+Connection identity gets a statement an `EXPLAIN`; the parameters get it a
+*useful* one. The desktop's DB screen binds this array by ordinal to turn a
+fingerprint back into the exact query that was slow, and the engine samples
+parameters across the latency distribution so the pathological run can be
+explained beside a healthy one.
+
+At most **32** values are rendered, each capped to **64 bytes**, so a statement
+bound with a large blob or a long `IN` list cannot turn one span into an
+unbounded payload. `db.parameters.count` is the true count, so a capped list is
+visible as such. A statement that bound nothing writes neither attribute.
+
+Values are rendered like PHP's bindings: `nil` as the empty string, `[]byte` as
+its text, `time.Time` as RFC 3339. Capping is by byte and may split a rune;
+the result is still valid JSON.
 
 ## Correlating CPU samples with traces
 

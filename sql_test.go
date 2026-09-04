@@ -384,3 +384,71 @@ func TestSQLSpanCarriesConnectionIdentity(t *testing.T) {
 		}
 	}
 }
+
+// The values a statement ran with are what let the desktop rebuild it for
+// EXPLAIN, so they must reach the span on both the connection's Query/Exec fast
+// path and the prepared-statement path.
+func TestSQLSpanCarriesBoundParameters(t *testing.T) {
+	dir := t.TempDir()
+	client := chronos.StartWithConfig(chronos.Config{
+		Enabled:      true,
+		Organisation: "org-local",
+		Project:      "project-a",
+		Application:  "stock-analytics",
+		SpoolDir:     dir,
+		ServiceName:  "stock-analytics",
+		APMEnabled:   true,
+	})
+	defer client.Shutdown(context.Background())
+
+	driverName := "chronos_fake_params_" + strings.ReplaceAll(t.Name(), "/", "_")
+	sql.Register(driverName, &fakeSQLDriver{})
+
+	db, err := client.OpenDB(driverName, "mem")
+	require.NoError(t, err)
+	defer db.Close()
+
+	ctx, parent := client.StartSpan(context.Background(), "GET /stock")
+
+	rows, err := db.QueryContext(ctx, "SELECT id FROM items WHERE client_id = ? AND state = ?", 42, "active")
+	require.NoError(t, err)
+	require.NoError(t, rows.Close())
+
+	stmt, err := db.PrepareContext(ctx, "UPDATE items SET n = ? WHERE client_id = ?")
+	require.NoError(t, err)
+	_, err = stmt.ExecContext(ctx, 7, 42)
+	require.NoError(t, err)
+	require.NoError(t, stmt.Close())
+
+	// A statement with no bindings writes neither attribute.
+	_, err = db.ExecContext(ctx, "DELETE FROM items")
+	require.NoError(t, err)
+
+	parent.End()
+	require.NoError(t, client.FlushSpans())
+
+	byName := map[string]map[string]any{}
+	for _, body := range readTraceBodies(t, dir) {
+		var batch map[string]any
+		require.NoError(t, json.Unmarshal([]byte(body), &batch))
+		spans, _ := batch["spans"].([]any)
+		for _, raw := range spans {
+			span, _ := raw.(map[string]any)
+			if name, _ := span["name"].(string); strings.HasPrefix(name, "SQL ") {
+				byName[name] = span
+			}
+		}
+	}
+
+	selectAttrs, _ := byName["SQL SELECT"]["attributes"].(map[string]any)
+	require.Equal(t, `["42","active"]`, selectAttrs["db.parameters"])
+	require.Equal(t, "2", selectAttrs["db.parameters.count"])
+
+	updateAttrs, _ := byName["SQL UPDATE"]["attributes"].(map[string]any)
+	require.Equal(t, `["7","42"]`, updateAttrs["db.parameters"])
+	require.Equal(t, "2", updateAttrs["db.parameters.count"])
+
+	deleteAttrs, _ := byName["SQL DELETE"]["attributes"].(map[string]any)
+	require.NotContains(t, deleteAttrs, "db.parameters")
+	require.NotContains(t, deleteAttrs, "db.parameters.count")
+}
