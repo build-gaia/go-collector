@@ -316,3 +316,41 @@ polyglot forwarder PHP uses — no Go-specific agent:
 
 Or run `chronos-collector` / `chronos-engine-agent` yourself against the spool
 directory with `CHRONOS_INGEST_URL` + `CHRONOS_INGEST_TOKEN`.
+
+## Consuming the SDK as a published module
+
+`sdks/go` is mirrored to [build-gaia/go-collector](https://github.com/build-gaia/go-collector)
+by `.github/workflows/split-go-sdk.yml` on every push to main. That repository
+is read-only: its main is overwritten by each split; only tags persist.
+
+To cut a version, tag **this** repository — the workflow republishes the tag
+on the mirror with the `go-sdk/` prefix stripped:
+
+```sh
+git tag go-sdk/v0.1.0 && git push origin go-sdk/v0.1.0
+git tag go-sdk/contrib/sarama/v0.1.0 && git push origin go-sdk/contrib/sarama/v0.1.0
+```
+
+(The nested contrib module needs its own tag series — that is how Go resolves
+a module in a subdirectory.)
+
+Consumers then require the chronos.dev paths and replace them with the mirror
+— no local checkout, no vendored SDK needed:
+
+```go
+require (
+    chronos.dev/collector/sdk/go v0.0.0
+    chronos.dev/collector/sdk/go/contrib/sarama v0.0.0
+)
+
+replace chronos.dev/collector/sdk/go => github.com/build-gaia/go-collector v0.1.0
+replace chronos.dev/collector/sdk/go/contrib/sarama => github.com/build-gaia/go-collector/contrib/sarama v0.1.0
+```
+
+(For the nested module Go maps version v0.1.0 to the repo tag
+`contrib/sarama/v0.1.0` by itself — the tag prefix never appears in go.mod.)
+
+If build-gaia/go-collector is private, consumers also need
+`GOPRIVATE=github.com/build-gaia` and git credentials for the fetch. If
+chronos.dev ever serves `go-import` meta tags pointing at the mirror, the
+replace lines disappear and the requires resolve directly.
