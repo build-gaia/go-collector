@@ -29,9 +29,43 @@ type Writer struct {
 	Dir string
 }
 
-// WriteJSON marshals value, hashes the body, and atomically publishes
-// {sha256}.{signal} via a tmp-{uuid} rename.
+// WriteJSON marshals value and appends it to the tenant's spool log as one
+// framed entry (ADR 0035), returning the segment it landed in.
+//
+// The name is kept from the era when this published {sha256}.{signal} through a
+// tmp-{uuid} rename. Every caller's contract is unchanged — hand over a value
+// and the signal it is, and it reaches the agent — but a document is now a
+// frame in a shared segment rather than a file of its own, which is one write
+// instead of a create, a write and a rename.
+//
+// The content address survives as the frame's id: it is what deduplicates a
+// document re-shipped after a failed POST, a job the filename used to do.
 func (w Writer) WriteJSON(signal Signal, value any) (string, error) {
+	if w.Dir == "" {
+		return "", fmt.Errorf("spool: empty directory")
+	}
+	body, err := json.Marshal(value)
+	if err != nil {
+		return "", fmt.Errorf("spool: marshal: %w", err)
+	}
+	sum := sha256.Sum256(body)
+	if err := Append(w.Dir, string(signal), "json", hex.EncodeToString(sum[:]), body); err != nil {
+		return "", err
+	}
+	generations := Generations(w.Dir)
+	if len(generations) == 0 {
+		return w.Dir, nil
+	}
+	return filepath.Join(w.Dir, segmentName(generations[len(generations)-1])), nil
+}
+
+// WriteDocumentFile is the pre-ADR-0035 write: content-addressed, published via
+// a tmp-{uuid} rename.
+//
+// Retained for the alias window — an agent that predates the framed log ships
+// whole files — and as the fallback for a spool directory the log layout cannot
+// be trusted on (a network filesystem, where a single append is not atomic).
+func (w Writer) WriteDocumentFile(signal Signal, value any) (string, error) {
 	if w.Dir == "" {
 		return "", fmt.Errorf("spool: empty directory")
 	}
