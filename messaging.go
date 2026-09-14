@@ -2,8 +2,10 @@ package chronos
 
 import (
 	"context"
+	"encoding/base64"
 	"strconv"
 	"time"
+	"unicode/utf8"
 )
 
 // Messaging spans: the half of the producer/consumer topology no broker can supply.
@@ -53,8 +55,12 @@ type MessagingSpan struct {
 	// or offset is treated as unknown, which is how Sarama spells "not assigned".
 	Partition int32
 	Offset    int64
-	// Payload size in bytes, when known. -1 is unknown.
+	// Payload size in bytes, when known. -1 is unknown. This is the FULL
+	// length even when the stored copy is capped.
 	BodySize int
+	// Raw payload, captured onto messaging.message.body when the client is
+	// capturing bodies. Binary is base64'd; size stays the raw length.
+	Body []byte
 	// The message key / id, when the caller has one that is safe to record.
 	MessageID string
 	// Consumer group, on a consume span.
@@ -121,10 +127,59 @@ func (c *Client) StartMessagingSpan(
 	if message.Offset >= 0 {
 		span.SetAttribute("messaging.kafka.offset", attrInt64(message.Offset))
 	}
-	if message.BodySize >= 0 {
-		span.SetAttribute("messaging.message.body.size", attrInt(message.BodySize))
+	size := message.BodySize
+	if size <= 0 && len(message.Body) > 0 {
+		size = len(message.Body)
 	}
+	if size >= 0 {
+		span.SetAttribute("messaging.message.body.size", attrInt(size))
+	}
+	c.applyMessagingBody(span, message.Body)
 	return ctx, span
+}
+
+// CaptureMessagingBodies is whether publish/consume payloads should be copied.
+func (c *Client) CaptureMessagingBodies() bool {
+	if c == nil {
+		return false
+	}
+	return c.cfg.Enabled && c.cfg.APMEnabled && c.cfg.MessagingCaptureBodies
+}
+
+func (c *Client) applyMessagingBody(span *Span, body []byte) {
+	if c == nil || !c.CaptureMessagingBodies() || len(body) == 0 {
+		return
+	}
+	raw := body
+	truncated := false
+	if max := c.cfg.MessagingMaxBody; max > 0 && len(raw) > max {
+		raw = raw[:max]
+		truncated = true
+	}
+	if text, ok := messagingText(raw); ok {
+		span.SetAttribute("messaging.message.body", text)
+	} else {
+		span.SetAttribute("messaging.message.body", base64.StdEncoding.EncodeToString(raw))
+		span.SetAttribute("messaging.message.body.encoding", "base64")
+	}
+	if truncated {
+		span.SetAttribute("messaging.message.body.truncated", "true")
+	}
+}
+
+// messagingText is PHP MessagingBody::isText: valid UTF-8 with no C0 controls
+// other than tab, LF, CR. A protobuf of small varints can be legal UTF-8 and
+// is still binary — the control-byte test is what rejects it.
+func messagingText(bytes []byte) (string, bool) {
+	if !utf8.Valid(bytes) {
+		return "", false
+	}
+	for _, b := range bytes {
+		if b < 0x20 && b != '\t' && b != '\n' && b != '\r' {
+			return "", false
+		}
+	}
+	return string(bytes), true
 }
 
 // A publish is a client call; a receive or process is server-side work. The same

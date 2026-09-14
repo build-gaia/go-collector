@@ -69,6 +69,13 @@ type Config struct {
 	// HTTPSkipPaths are URL paths that skip APM spans (probes / UI polls). Exact match.
 	HTTPSkipPaths []string
 
+	// MessagingCaptureBodies keeps publish/consume payloads on the span.
+	// Default on: a messaging span that only records a byte count cannot
+	// answer what crossed the broker. An explicit false turns payloads off.
+	MessagingCaptureBodies bool
+	// MessagingMaxBody caps stored payload bytes. 0 / unset means no cap.
+	MessagingMaxBody int
+
 	// Background starts profiler/metrics loops. Start() sets this true; tests leave it false.
 	Background bool
 }
@@ -104,10 +111,12 @@ func LoadConfig() Config {
 		SpanBatchSize:        envInt("CHRONOS_GO_SPAN_BATCH_SIZE", defaultSpanBatchSize),
 		SpanFlushInterval:    envDuration("CHRONOS_GO_SPAN_FLUSH_INTERVAL", defaultSpanFlushInterval),
 		SpanMaxBuffered:      envInt("CHRONOS_GO_SPAN_MAX_BUFFERED", 10000),
-		HTTPCapture:          envBool("CHRONOS_GO_HTTP_CAPTURE", true),
-		HTTPCaptureBodies:    envBool("CHRONOS_GO_HTTP_CAPTURE_BODIES", false),
-		HTTPMaxBody:          envInt("CHRONOS_GO_HTTP_CAPTURE_MAX_BODY", 65536),
-		HTTPRedact:           envBool("CHRONOS_GO_HTTP_CAPTURE_REDACT", true),
+		HTTPCapture:            envBool("CHRONOS_GO_HTTP_CAPTURE", true),
+		HTTPCaptureBodies:      envBool("CHRONOS_GO_HTTP_CAPTURE_BODIES", true),
+		HTTPMaxBody:            envInt("CHRONOS_GO_HTTP_CAPTURE_MAX_BODY", 65536),
+		HTTPRedact:             envBool("CHRONOS_GO_HTTP_CAPTURE_REDACT", true),
+		MessagingCaptureBodies: envBool("CHRONOS_GO_MESSAGING_CAPTURE_BODIES", true),
+		MessagingMaxBody:       envInt("CHRONOS_GO_MESSAGING_CAPTURE_MAX_BODY", 0),
 		RedactPatterns:       envCSV("CHRONOS_GO_REDACT_PATTERNS", defaultRedactPatterns),
 		HTTPSkipPaths:        envCSV("CHRONOS_GO_HTTP_SKIP_PATHS", defaultHTTPSkipPaths),
 	}
