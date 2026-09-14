@@ -2,13 +2,12 @@ package sarama
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	chronos "chronos.dev/collector/sdk/go"
+	"chronos.dev/collector/sdk/go/spool"
 	"github.com/IBM/sarama"
 	"github.com/IBM/sarama/mocks"
 )
@@ -39,23 +38,19 @@ func spooling(t *testing.T) (*chronos.Client, string) {
 	return client, dir
 }
 
-// spooled returns every trace document written, as raw JSON.
+// spooled returns every trace document written, as raw JSON. Documents are
+// frames in a shared segment since ADR 0035, not files named by signal.
 func spooled(t *testing.T, dir string) string {
 	t.Helper()
-	var all strings.Builder
-	entries, err := os.ReadDir(dir)
+	frames, err := spool.Read(dir)
 	if err != nil {
 		t.Fatalf("read spool: %v", err)
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".trace") {
-			continue
+	var all strings.Builder
+	for _, frame := range frames {
+		if frame.Signal == string(spool.SignalTrace) {
+			all.Write(frame.Payload)
 		}
-		body, err := os.ReadFile(filepath.Join(dir, entry.Name()))
-		if err != nil {
-			t.Fatalf("read %s: %v", entry.Name(), err)
-		}
-		all.Write(body)
 	}
 	return all.String()
 }

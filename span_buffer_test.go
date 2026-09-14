@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -30,15 +29,12 @@ func batchingClient(t *testing.T, dir string, batchSize, maxBuffered int) *chron
 	})
 }
 
-// readSpanBatches returns each spooled .trace document's span list.
+// readSpanBatches returns each spooled trace document's span list.
 func readSpanBatches(t *testing.T, dir string) [][]map[string]any {
 	t.Helper()
-	files, err := filepath.Glob(filepath.Join(dir, "*.trace"))
-	require.NoError(t, err)
-	out := make([][]map[string]any, 0, len(files))
-	for _, f := range files {
-		raw, err := os.ReadFile(f)
-		require.NoError(t, err)
+	payloads := spooled(t, dir, "trace")
+	out := make([][]map[string]any, 0, len(payloads))
+	for _, raw := range payloads {
 		var batch struct {
 			Schema    string           `json:"schema"`
 			SpanCount string           `json:"spanCount"`

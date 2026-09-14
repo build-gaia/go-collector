@@ -6,9 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -20,19 +18,46 @@ import (
 	"chronos.dev/collector/sdk/go/spool"
 )
 
+// spooled returns the payloads of every frame of one signal, in write order.
+//
+// A document used to be a file named {sha256}.{signal}; since ADR 0035 it is a
+// frame in a shared append-only segment, so the tests read frames rather than
+// globbing extensions. Frame order is the write order, which is also why
+// readMetricsPoints no longer has to sort by file mtime to recover it.
+func spooled(t *testing.T, dir, signal string) [][]byte {
+	t.Helper()
+	frames, err := spool.Read(dir)
+	require.NoError(t, err)
+	var payloads [][]byte
+	for _, frame := range frames {
+		if frame.Signal == signal {
+			payloads = append(payloads, frame.Payload)
+		}
+	}
+	return payloads
+}
+
 func TestSpoolAtomicWrite(t *testing.T) {
 	dir := t.TempDir()
 	w := spool.Writer{Dir: dir}
 	path, err := w.WriteJSON(spool.SignalTrace, map[string]any{"schema": "test", "n": 1})
 	require.NoError(t, err)
-	require.True(t, strings.HasSuffix(path, ".trace"))
+
+	// The document lands as a frame in the active segment, not as a file of
+	// its own, and WriteJSON returns the segment it went into.
+	require.True(t, strings.HasSuffix(path, ".spool"))
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.False(t, strings.HasPrefix(entries[0].Name(), "tmp-"))
-	body, err := os.ReadFile(path)
+
+	frames, err := spool.Read(dir)
 	require.NoError(t, err)
-	require.Contains(t, string(body), `"schema":"test"`)
+	require.Len(t, frames, 1)
+	require.Equal(t, string(spool.SignalTrace), frames[0].Signal)
+	require.Equal(t, "json", frames[0].Encoding)
+	require.NotEmpty(t, frames[0].ID, "the content address is the frame id")
+	require.Contains(t, string(frames[0].Payload), `"schema":"test"`)
 }
 
 func TestRedactMasksSensitiveKeys(t *testing.T) {
@@ -122,12 +147,10 @@ func TestHTTPMiddlewareWritesTrace(t *testing.T) {
 	require.NotEmpty(t, rr.Header().Get("traceparent"))
 
 	require.NoError(t, client.FlushSpans())
-	files, err := filepath.Glob(filepath.Join(dir, "*.trace"))
-	require.NoError(t, err)
-	require.Len(t, files, 1)
+	payloads := spooled(t, dir, "trace")
+	require.Len(t, payloads, 1)
 
-	raw, err := os.ReadFile(files[0])
-	require.NoError(t, err)
+	raw := payloads[0]
 	var batch map[string]any
 	require.NoError(t, json.Unmarshal(raw, &batch))
 	require.Equal(t, "chronos.tracing.span-batch.v1", batch["schema"])
@@ -181,11 +204,9 @@ func TestHTTPMiddlewareSkipsConfiguredPaths(t *testing.T) {
 	handler.ServeHTTP(rr2, httptest.NewRequest(http.MethodGet, "http://example.test/work", nil))
 
 	require.NoError(t, client.FlushSpans())
-	files, err := filepath.Glob(filepath.Join(dir, "*.trace"))
-	require.NoError(t, err)
-	require.Len(t, files, 1)
-	raw, err := os.ReadFile(files[0])
-	require.NoError(t, err)
+	payloads := spooled(t, dir, "trace")
+	require.Len(t, payloads, 1)
+	raw := payloads[0]
 	require.Contains(t, string(raw), `"name":"GET /work"`)
 	require.NotContains(t, string(raw), `"name":"GET /status"`)
 }
@@ -206,11 +227,9 @@ func TestLogWritesBatch(t *testing.T) {
 	client.Log(ctx, "error", "checkout failed", map[string]string{"order": "789"})
 	span.End()
 
-	files, err := filepath.Glob(filepath.Join(dir, "*.log"))
-	require.NoError(t, err)
-	require.Len(t, files, 1)
-	raw, err := os.ReadFile(files[0])
-	require.NoError(t, err)
+	payloads := spooled(t, dir, "log")
+	require.Len(t, payloads, 1)
+	raw := payloads[0]
 	require.Contains(t, string(raw), `"schema":"chronos.tracing.log-batch.v1"`)
 	require.Contains(t, string(raw), `"body":"checkout failed"`)
 	require.Contains(t, string(raw), span.TraceID)
@@ -230,11 +249,9 @@ func TestMetricsPoint(t *testing.T) {
 	})
 	defer client.Shutdown(context.Background())
 	require.NoError(t, client.EmitRuntimeMetrics())
-	files, err := filepath.Glob(filepath.Join(dir, "*.metrics"))
-	require.NoError(t, err)
-	require.Len(t, files, 1)
-	raw, err := os.ReadFile(files[0])
-	require.NoError(t, err)
+	payloads := spooled(t, dir, "metrics")
+	require.Len(t, payloads, 1)
+	raw := payloads[0]
 	require.Contains(t, string(raw), `"schema":"chronos.runtime.metrics.v1"`)
 	require.Contains(t, string(raw), `"process.runtime.name":"go"`)
 }
@@ -264,13 +281,11 @@ func TestCPUProfileNormalizesToSampleBatch(t *testing.T) {
 	require.NoError(t, client.CollectCPUProfile(50*time.Millisecond))
 	<-done
 
-	files, err := filepath.Glob(filepath.Join(dir, "*.profile"))
-	require.NoError(t, err)
-	if len(files) == 0 {
+	payloads := spooled(t, dir, "profile")
+	if len(payloads) == 0 {
 		t.Skip("CPU profile produced no samples in this environment")
 	}
-	raw, err := os.ReadFile(files[0])
-	require.NoError(t, err)
+	raw := payloads[0]
 	var batch map[string]any
 	require.NoError(t, json.Unmarshal(raw, &batch))
 	require.Equal(t, "chronos.profiling.sample-batch.v1", batch["schema"])
@@ -376,35 +391,16 @@ func testTotalGC() uint32 {
 }
 
 // readMetricsPoints returns every runtime point in the spool, OLDEST FIRST.
-// Spool file names are content-addressed, so the write order is only recoverable
-// from the file times.
+// Frames are appended in write order, so no sorting is needed; the old
+// content-addressed filenames carried no order and had to be sorted by mtime.
 func readMetricsPoints(t *testing.T, dir string) []map[string]any {
 	t.Helper()
-	entries, err := os.ReadDir(dir)
-	require.NoError(t, err)
-
-	type spooled struct {
-		modified time.Time
-		point    map[string]any
-	}
-	var found []spooled
-	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".metrics") {
-			continue
-		}
-		info, err := entry.Info()
-		require.NoError(t, err)
-		body, err := os.ReadFile(filepath.Join(dir, entry.Name()))
-		require.NoError(t, err)
+	payloads := spooled(t, dir, "metrics")
+	points := make([]map[string]any, 0, len(payloads))
+	for _, payload := range payloads {
 		var point map[string]any
-		require.NoError(t, json.Unmarshal(body, &point))
-		found = append(found, spooled{modified: info.ModTime(), point: point})
-	}
-	sort.Slice(found, func(i, j int) bool { return found[i].modified.Before(found[j].modified) })
-
-	points := make([]map[string]any, 0, len(found))
-	for _, entry := range found {
-		points = append(points, entry.point)
+		require.NoError(t, json.Unmarshal(payload, &point))
+		points = append(points, point)
 	}
 	return points
 }

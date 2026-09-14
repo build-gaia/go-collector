@@ -1,6 +1,7 @@
 package spool
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -266,4 +267,73 @@ func Append(dir, signal, encoding, id string, payload []byte) error {
 	}
 	// No Sync. See the package documentation and ADR 0035 §1.
 	return nil
+}
+
+// Frame is one decoded spool entry.
+type Frame struct {
+	Signal   string
+	Encoding string
+	ID       string
+	Payload  []byte
+}
+
+// DecodeFrames reads every frame in a segment's bytes.
+//
+// The counterpart to EncodeFrame, and exported for the same reason: the format
+// is a cross-language contract, and the only way to keep an encoder honest is
+// to decode what it wrote. It is also what any reader of a spool directory
+// needs, now that a document is a frame rather than a file.
+//
+// A truncated tail is not an error. A writer can be interrupted mid-append, and
+// the frames before that point are still intact and still worth reading.
+func DecodeFrames(data []byte) ([]Frame, error) {
+	var frames []Frame
+	for offset := 0; offset+framePrefixBytes <= len(data); {
+		if !bytes.Equal(data[offset:offset+4], frameMagic[:]) {
+			return frames, fmt.Errorf("spool: frame boundary lost at byte %d", offset)
+		}
+		headerLen := int(binary.LittleEndian.Uint16(data[offset+4 : offset+6]))
+		payloadLen := int(binary.LittleEndian.Uint32(data[offset+6 : offset+10]))
+		checksum := binary.LittleEndian.Uint32(data[offset+10 : offset+14])
+
+		start := offset + framePrefixBytes
+		end := start + headerLen + payloadLen
+		if end > len(data) {
+			return frames, nil // truncated tail
+		}
+		body := data[start:end]
+		if crc32.ChecksumIEEE(body) != checksum {
+			return frames, fmt.Errorf("spool: checksum mismatch at byte %d", offset)
+		}
+
+		var header frameHeader
+		if err := json.Unmarshal(body[:headerLen], &header); err != nil {
+			return frames, fmt.Errorf("spool: frame header at byte %d: %w", offset, err)
+		}
+		frames = append(frames, Frame{
+			Signal:   header.Signal,
+			Encoding: header.Encoding,
+			ID:       header.ID,
+			Payload:  append([]byte(nil), body[headerLen:]...),
+		})
+		offset = end
+	}
+	return frames, nil
+}
+
+// Read returns every frame in a spool directory, oldest segment first.
+func Read(dir string) ([]Frame, error) {
+	var frames []Frame
+	for _, generation := range Generations(dir) {
+		data, err := os.ReadFile(filepath.Join(dir, segmentName(generation)))
+		if err != nil {
+			return frames, err
+		}
+		decoded, err := DecodeFrames(data)
+		frames = append(frames, decoded...)
+		if err != nil {
+			return frames, err
+		}
+	}
+	return frames, nil
 }

@@ -6,8 +6,6 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -150,16 +148,9 @@ func TestSQLWithoutParentEmitsNothing(t *testing.T) {
 
 func readTraceBodies(t *testing.T, dir string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(dir)
-	require.NoError(t, err)
 	var out []string
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".trace") {
-			continue
-		}
-		body, err := os.ReadFile(filepath.Join(dir, e.Name()))
-		require.NoError(t, err)
-		out = append(out, string(body))
+	for _, payload := range spooled(t, dir, "trace") {
+		out = append(out, string(payload))
 	}
 	return out
 }
@@ -293,15 +284,8 @@ func TestSQLSkipsIOSamplesBelowMinWait(t *testing.T) {
 // readProfileSamples returns every spooled sample belonging to one profile series.
 func readProfileSamples(t *testing.T, dir, seriesID string) []map[string]any {
 	t.Helper()
-	entries, err := os.ReadDir(dir)
-	require.NoError(t, err)
 	var out []map[string]any
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".profile") {
-			continue
-		}
-		body, err := os.ReadFile(filepath.Join(dir, e.Name()))
-		require.NoError(t, err)
+	for _, body := range spooled(t, dir, "profile") {
 		var batch struct {
 			Samples []map[string]any `json:"samples"`
 		}
