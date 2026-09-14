@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	chronos "chronos.dev/collector/sdk/go"
 	"github.com/IBM/sarama"
@@ -195,14 +196,14 @@ func (c *stubClaim) Messages() <-chan *sarama.ConsumerMessage { return c.message
 
 type stubSession struct{ ctx context.Context }
 
-func (s *stubSession) Claims() map[string][]int32 { return nil }
-func (s *stubSession) MemberID() string           { return "member" }
-func (s *stubSession) GenerationID() int32        { return 1 }
-func (s *stubSession) MarkOffset(string, int32, int64, string) {}
-func (s *stubSession) Commit()                                 {}
-func (s *stubSession) ResetOffset(string, int32, int64, string) {}
+func (s *stubSession) Claims() map[string][]int32                  { return nil }
+func (s *stubSession) MemberID() string                            { return "member" }
+func (s *stubSession) GenerationID() int32                         { return 1 }
+func (s *stubSession) MarkOffset(string, int32, int64, string)     {}
+func (s *stubSession) Commit()                                     {}
+func (s *stubSession) ResetOffset(string, int32, int64, string)    {}
 func (s *stubSession) MarkMessage(*sarama.ConsumerMessage, string) {}
-func (s *stubSession) Context() context.Context { return s.ctx }
+func (s *stubSession) Context() context.Context                    { return s.ctx }
 
 func TestConsumeSpansTheHandlerAndJoinsThePublishTrace(t *testing.T) {
 	client, dir := spooling(t)
@@ -267,5 +268,82 @@ func TestConsumeStartsItsOwnTraceWhenThePublisherIsUninstrumented(t *testing.T) 
 	}
 	if body := spooled(t, dir); !strings.Contains(body, `"PROCESS movements"`) {
 		t.Errorf("no consume span was recorded\n%s", body)
+	}
+}
+
+// selectLoopHandler writes its claim loop the way sarama's own docs and most
+// handlers do, calling claim.Messages() on every iteration of the select.
+type selectLoopHandler struct{ seen [][]byte }
+
+func (h *selectLoopHandler) Setup(sarama.ConsumerGroupSession) error   { return nil }
+func (h *selectLoopHandler) Cleanup(sarama.ConsumerGroupSession) error { return nil }
+
+func (h *selectLoopHandler) ConsumeClaim(
+	session sarama.ConsumerGroupSession,
+	claim sarama.ConsumerGroupClaim,
+) error {
+	for {
+		select {
+		case message := <-claim.Messages():
+			if message == nil {
+				return nil
+			}
+			h.seen = append(h.seen, message.Value)
+		case <-session.Context().Done():
+			return nil
+		}
+	}
+}
+
+// A handler that calls Messages() per iteration must still see every message.
+// When the proxy was rebuilt on each call, each orphaned goroutine raced the
+// others for the source and then blocked forever writing into a channel nobody
+// held, so messages were consumed from the broker and silently dropped.
+func TestMessagesIsIdempotentSoASelectLoopSeesEveryMessage(t *testing.T) {
+	client, _ := spooling(t)
+
+	const count = 50
+	claim := &stubClaim{messages: make(chan *sarama.ConsumerMessage, count)}
+	for i := 0; i < count; i++ {
+		claim.messages <- &sarama.ConsumerMessage{
+			Topic:     "movements",
+			Partition: 3,
+			Offset:    int64(i),
+			Value:     []byte{byte(i)},
+		}
+	}
+	close(claim.messages)
+
+	handler := &selectLoopHandler{}
+	wrapped := WrapConsumerGroupHandler(handler, client, "group")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = wrapped.ConsumeClaim(&stubSession{ctx: context.Background()}, claim)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConsumeClaim did not return: the proxy swallowed messages")
+	}
+
+	if len(handler.seen) != count {
+		t.Fatalf("handler saw %d of %d messages", len(handler.seen), count)
+	}
+}
+
+// Messages() must hand back the same channel every time, as sarama's does.
+func TestMessagesReturnsTheSameChannel(t *testing.T) {
+	client, _ := spooling(t)
+	claim := &stubClaim{messages: make(chan *sarama.ConsumerMessage, 1)}
+	wrapped := &instrumentedClaim{
+		ConsumerGroupClaim: claim,
+		handler:            &ConsumerGroupHandler{client: client},
+		session:            &stubSession{ctx: context.Background()},
+	}
+	if wrapped.Messages() != wrapped.Messages() {
+		t.Fatal("Messages() returned a different channel on the second call")
 	}
 }

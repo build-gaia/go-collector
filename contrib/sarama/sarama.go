@@ -32,6 +32,8 @@
 package sarama
 
 import (
+	"sync"
+
 	"context"
 	"strconv"
 	"strings"
@@ -107,6 +109,7 @@ func (p *SyncProducer) SendMessageContext(
 		Partition: -1,
 		Offset:    -1,
 		BodySize:  encoderLength(message.Value),
+		Body:      encoderBytes(p.client, message.Value),
 		MessageID: keyOf(message.Key),
 	})
 	defer span.End()
@@ -154,6 +157,7 @@ func (p *SyncProducer) SendMessagesContext(
 			Partition:   -1,
 			Offset:      -1,
 			BodySize:    encoderLength(message.Value),
+			Body:        encoderBytes(p.client, message.Value),
 			MessageID:   keyOf(message.Key),
 		})
 		inject(messageCtx, message)
@@ -235,26 +239,41 @@ type instrumentedClaim struct {
 	sarama.ConsumerGroupClaim
 	handler *ConsumerGroupHandler
 	session sarama.ConsumerGroupSession
+
+	// once guards the proxy so that Messages() is idempotent, the way
+	// sarama's own is.
+	once sync.Once
+	out  <-chan *sarama.ConsumerMessage
 }
 
 // Messages proxies the claim channel, opening a span as each message is handed to
 // the handler and closing it when the next one is taken (or the channel closes).
+//
+// It returns the SAME channel on every call. sarama's ConsumerGroupClaim does,
+// and handlers rely on it: `for { select { case m := <-claim.Messages(): } }` is
+// an ordinary way to write a claim loop. Spawning a proxy per call turns that
+// into a goroutine leak where every orphan races the others for the source and
+// then blocks forever writing into a channel nobody holds, so messages are
+// consumed from the broker and silently dropped.
 func (c *instrumentedClaim) Messages() <-chan *sarama.ConsumerMessage {
-	source := c.ConsumerGroupClaim.Messages()
-	out := make(chan *sarama.ConsumerMessage)
-	go func() {
-		defer close(out)
-		var open *chronos.Span
-		defer func() { open.End() }()
-		for message := range source {
-			// The previous message is done the moment the handler asks for the
-			// next one.
-			open.End()
-			open = c.handler.start(c.session.Context(), message)
-			out <- message
-		}
-	}()
-	return out
+	c.once.Do(func() {
+		source := c.ConsumerGroupClaim.Messages()
+		out := make(chan *sarama.ConsumerMessage)
+		c.out = out
+		go func() {
+			defer close(out)
+			var open *chronos.Span
+			defer func() { open.End() }()
+			for message := range source {
+				// The previous message is done the moment the handler asks for
+				// the next one.
+				open.End()
+				open = c.handler.start(c.session.Context(), message)
+				out <- message
+			}
+		}()
+	})
+	return c.out
 }
 
 // start opens the span for one consumed message, parented onto the publish when the
@@ -275,6 +294,7 @@ func (h *ConsumerGroupHandler) start(
 		Partition:     message.Partition,
 		Offset:        message.Offset,
 		BodySize:      len(message.Value),
+		Body:          consumeBody(h.client, message.Value),
 		MessageID:     string(message.Key),
 	})
 	return span
@@ -303,6 +323,24 @@ func encoderLength(encoder sarama.Encoder) int {
 		return -1
 	}
 	return encoder.Length()
+}
+
+func encoderBytes(c *chronos.Client, encoder sarama.Encoder) []byte {
+	if encoder == nil || !c.CaptureMessagingBodies() {
+		return nil
+	}
+	body, err := encoder.Encode()
+	if err != nil {
+		return nil
+	}
+	return body
+}
+
+func consumeBody(c *chronos.Client, value []byte) []byte {
+	if !c.CaptureMessagingBodies() {
+		return nil
+	}
+	return value
 }
 
 // keyOf renders a message key as an id, and only when it is already text. A binary
