@@ -15,6 +15,14 @@
 // `messaging.operation` - so instrumenting a service here is what turns that view's
 // "not instrumented" into a named writer.
 //
+// # Batch consumers
+//
+// A consumer that accumulates messages and flushes them in groups is a different
+// shape, and the per-message wrapper measures it wrongly: the span closes as the
+// message is appended to a slice, long before the flush does the work. batch.go has
+// the API for that case - a span over the flush, and a per-message context the
+// handler can hand to whatever one message causes.
+//
 // # Trace continuity across the broker
 //
 // The producer writes the active span as a `traceparent` message header and the
@@ -313,21 +321,40 @@ func (h *ConsumerGroupHandler) start(
 	ctx context.Context,
 	message *sarama.ConsumerMessage,
 ) *chronos.Span {
+	_, span := startProcessSpan(ctx, h.client, h.group, message)
+	return span
+}
+
+// startProcessSpan is THE definition of what a consumed message looks like, used by
+// both the per-message wrapper above and the batch API in batch.go.
+//
+// One definition rather than two because the attribute set is a contract with the
+// engine, not a local choice: `messaging.destination.name` is what attributes the
+// span to a stream and `messaging.operation` is what gives it a direction, so a
+// second copy that drifted by one key would make half this service's consume spans
+// silently unjoinable. It returns the derived context as well as the span, because
+// the batch API's whole purpose is handing that context to the handler.
+func startProcessSpan(
+	ctx context.Context,
+	c *chronos.Client,
+	group string,
+	message *sarama.ConsumerMessage,
+) (context.Context, *chronos.Span) {
 	if message == nil {
-		return nil
+		return ctx, nil
 	}
 	remote, enqueuedAt := extract(message)
 	ctx = chronos.ContextWithRemoteContext(ctx, remote)
 	started := time.Now()
-	_, span := h.client.StartMessagingSpan(ctx, chronos.MessagingSpan{
+	ctx, span := c.StartMessagingSpan(ctx, chronos.MessagingSpan{
 		System:        System,
 		Operation:     chronos.OperationProcess,
 		Destination:   message.Topic,
-		ConsumerGroup: h.group,
+		ConsumerGroup: group,
 		Partition:     message.Partition,
 		Offset:        message.Offset,
 		BodySize:      len(message.Value),
-		Body:          consumeBody(h.client, message.Value),
+		Body:          consumeBody(c, message.Value),
 		MessageID:     string(message.Key),
 	})
 	// How long the message sat between the publish and this handler. Only the
@@ -337,7 +364,7 @@ func (h *ConsumerGroupHandler) start(
 	if waited, ok := chronos.WaitMilliseconds(enqueuedAt, started); ok {
 		span.SetAttribute("messaging.message.queue_time_ms", itoa(waited))
 	}
-	return span
+	return ctx, span
 }
 
 // extract reads the context a producer wrote: the W3C trio, plus the enqueued-at

@@ -25,6 +25,8 @@ type spanRecord struct {
 	SpanID       string            `json:"spanId"`
 	ParentSpanID string            `json:"parentSpanId"`
 	Name         string            `json:"name"`
+	StartedAt    string            `json:"startedAt"`
+	EndedAt      string            `json:"endedAt"`
 	Attributes   map[string]string `json:"attributes"`
 }
 
