@@ -2,9 +2,7 @@ package chronos
 
 import (
 	"context"
-	"fmt"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -30,22 +28,38 @@ type Span struct {
 	Attributes  map[string]string
 	Status      string
 	ServiceName string
-	HTTPMethod  string
-	HTTPRoute   string
-	HTTPStatus  uint32
+	// Sampled is the trace's sampling decision as it arrived, or true for a trace
+	// this process started: there is no sampler on the Go side, so a locally born
+	// trace is always sampled and an inherited flag is passed on untouched.
+	Sampled bool
+	// Tracestate and Baggage are the inbound companion headers, held so every
+	// outbound carrier this span fathers can forward them. Empty when absent.
+	Tracestate string
+	Baggage    string
+	HTTPMethod string
+	HTTPRoute  string
+	HTTPStatus uint32
 }
 
 // StartSpan begins a child span under the ambient context span (if any).
 func (c *Client) StartSpan(ctx context.Context, name string) (context.Context, *Span) {
 	if c == nil || !c.cfg.Enabled || !c.cfg.APMEnabled {
-		return ctx, &Span{Name: name, StartedAt: time.Now().UTC(), Attributes: map[string]string{}}
+		return ctx, &Span{Name: name, StartedAt: time.Now().UTC(), Attributes: map[string]string{}, Sampled: true}
 	}
 	parent := SpanFromContext(ctx)
 	traceID := newTraceID()
 	parentID := ""
+	// A trace this process starts is sampled; one it joins keeps whatever decision
+	// the originator made, along with the context it is obliged to forward.
+	sampled := true
+	tracestate := ""
+	baggage := ""
 	if parent != nil && parent.TraceID != "" {
 		traceID = parent.TraceID
 		parentID = parent.SpanID
+		sampled = parent.Sampled
+		tracestate = parent.Tracestate
+		baggage = parent.Baggage
 	}
 	span := &Span{
 		cfg:         c.cfg,
@@ -60,6 +74,9 @@ func (c *Client) StartSpan(ctx context.Context, name string) (context.Context, *
 		Attributes:  map[string]string{},
 		Status:      "ok",
 		ServiceName: c.cfg.ServiceName,
+		Sampled:     sampled,
+		Tracestate:  tracestate,
+		Baggage:     baggage,
 	}
 	return context.WithValue(ctx, spanContextKey{}, span), span
 }
@@ -164,23 +181,46 @@ func (s *Span) finish() (spanRecord, bool) {
 }
 
 // Traceparent returns a W3C traceparent header value for outbound propagation.
+//
+// The flags byte is the span's own Sampled decision rather than a hardcoded `01`:
+// the sampling decision belongs to whoever started the trace, and re-rendering an
+// inherited `00` as `01` resurrects downstream half of a trace whose other half was
+// deliberately dropped. See RemoteContext.
 func (s *Span) Traceparent() string {
-	if s == nil || s.TraceID == "" || s.SpanID == "" {
+	if s == nil {
 		return ""
 	}
-	return fmt.Sprintf("00-%s-%s-01", s.TraceID, s.SpanID)
+	return FormatTraceparent(s.TraceID, s.SpanID, s.Sampled)
 }
 
-// ParseTraceparent extracts trace-id and parent-id from a W3C traceparent header.
-func ParseTraceparent(header string) (traceID, spanID string, ok bool) {
-	parts := strings.Split(strings.TrimSpace(header), "-")
-	if len(parts) != 4 {
-		return "", "", false
+// RemoteContext renders the span as the context to hand the next hop: the
+// traceparent naming THIS span, plus the tracestate and baggage it inherited, which
+// W3C requires a participant to forward unchanged.
+func (s *Span) RemoteContext() RemoteContext {
+	if s == nil {
+		return RemoteContext{}
 	}
-	if len(parts[1]) != 32 || len(parts[2]) != 16 {
-		return "", "", false
+	return RemoteContext{
+		TraceID:    s.TraceID,
+		SpanID:     s.SpanID,
+		Sampled:    s.Sampled,
+		Tracestate: s.Tracestate,
+		Baggage:    s.Baggage,
 	}
-	return parts[1], parts[2], true
+}
+
+// Adopt reparents the span onto an extracted remote context, carrying its sampling
+// flag and companion headers. For the server-side case where the span has to exist
+// before the inbound headers are read.
+func (s *Span) Adopt(remote RemoteContext) {
+	if s == nil || !remote.Valid() {
+		return
+	}
+	s.TraceID = remote.TraceID
+	s.ParentID = remote.SpanID
+	s.Sampled = remote.Sampled
+	s.Tracestate = remote.Tracestate
+	s.Baggage = remote.Baggage
 }
 
 type spanBatch struct {

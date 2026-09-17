@@ -134,11 +134,20 @@ func TestPublishDoesNotOverwriteAnExistingTraceparent(t *testing.T) {
 	if _, _, err := traced.SendMessageContext(ctx, message); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	if count := len(message.Headers); count != 1 {
-		t.Fatalf("expected the caller's header to survive alone, got %d headers", count)
+	// Counting headers is no longer the assertion: a publish also stamps
+	// x-chronos-enqueued-at. What must hold is that the caller's traceparent is
+	// still there, still theirs, and still the only one.
+	var traceparents []string
+	for _, header := range message.Headers {
+		if strings.EqualFold(string(header.Key), chronos.TraceparentHeader) {
+			traceparents = append(traceparents, string(header.Value))
+		}
 	}
-	if got := string(message.Headers[0].Value); got != existing {
-		t.Errorf("header was overwritten: %s", got)
+	if len(traceparents) != 1 {
+		t.Fatalf("expected exactly one traceparent, got %d", len(traceparents))
+	}
+	if traceparents[0] != existing {
+		t.Errorf("header was overwritten: %s", traceparents[0])
 	}
 }
 

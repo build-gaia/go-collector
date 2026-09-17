@@ -20,9 +20,16 @@
 // The producer writes the active span as a `traceparent` message header and the
 // consumer parses it back, so the work a message causes is a child of the publish
 // that caused it - across processes and across languages, since the PHP collector
-// reads the same header. A message with no header starts its own trace rather than
-// being dropped: an uninstrumented publisher must not cost the consumer its
-// telemetry.
+// reads the same header. Alongside it go the `tracestate` and `baggage` this
+// process received (W3C obliges a forwarder to pass on state it does not
+// understand) and `x-chronos-enqueued-at`, the publish instant a consumer needs to
+// say how long the message waited. The set, the spelling and the number format are
+// PHP's MessagingSpan::contextHeaders(), so a mixed-language topic is one topic.
+//
+// A message with no header, or one whose traceparent does not satisfy the W3C
+// grammar both SDKs enforce, starts its own trace rather than being dropped or
+// parented onto an id nobody minted: an uninstrumented publisher must not cost the
+// consumer its telemetry, and a believed-but-wrong parent is worse than none.
 //
 // # Fail-open, always
 //
@@ -37,6 +44,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"time"
 
 	chronos "chronos.dev/collector/sdk/go"
 	"github.com/IBM/sarama"
@@ -174,22 +182,45 @@ func (p *SyncProducer) SendMessagesContext(
 	return err
 }
 
-// inject writes the active span onto the message as a W3C traceparent header. A
-// message that already carries one is left alone - the caller propagated it
-// deliberately and overwriting would reparent their trace.
+// inject writes the outbound context onto the record headers: the W3C traceparent,
+// the tracestate and baggage this process is forwarding, and the publish instant.
+//
+// The set and the spelling are PHP's MessagingSpan::contextHeaders(), because a
+// mixed-language topic only works if both producers write the same fields — a Go
+// publish that omits tracestate ends another vendor's context at the broker, and
+// one that omits the enqueued-at stamp makes queue wait unmeasurable for every PHP
+// consumer of that topic (MessagingWait has nothing to subtract from).
+//
+// A header the caller already set is left alone, per key. That is PHP's
+// `$headers + contextHeaders()` precedence: they propagated it deliberately, and
+// overwriting would reparent their trace or restate their clock.
+//
+// The stamp rides even when there is no span to propagate. A message published from
+// a cron with no trace to continue has still waited just as long, and dropping the
+// stamp would throw that measurement away too.
 func inject(ctx context.Context, message *sarama.ProducerMessage) {
-	header := chronos.TraceparentFromContext(ctx)
-	if header == "" {
+	span := chronos.SpanFromContext(ctx)
+	setHeader(message, chronos.TraceparentHeader, span.Traceparent())
+	setHeader(message, chronos.TracestateHeader, chronos.TracestateFromContext(ctx))
+	setHeader(message, chronos.BaggageHeader, chronos.BaggageFromContext(ctx))
+	setHeader(message, chronos.EnqueuedAtHeader, chronos.FormatEnqueuedAt(time.Now()))
+}
+
+// setHeader appends one record header unless it is empty or the caller already
+// wrote that key. Kafka record header keys are raw bytes under whatever case the
+// producer chose, so the comparison is case-insensitive in both directions.
+func setHeader(message *sarama.ProducerMessage, key, value string) {
+	if value == "" {
 		return
 	}
 	for _, existing := range message.Headers {
-		if strings.EqualFold(string(existing.Key), chronos.TraceparentHeader) {
+		if strings.EqualFold(string(existing.Key), key) {
 			return
 		}
 	}
 	message.Headers = append(message.Headers, sarama.RecordHeader{
-		Key:   []byte(chronos.TraceparentHeader),
-		Value: []byte(header),
+		Key:   []byte(key),
+		Value: []byte(value),
 	})
 }
 
@@ -285,7 +316,9 @@ func (h *ConsumerGroupHandler) start(
 	if message == nil {
 		return nil
 	}
-	ctx = chronos.ContextWithRemoteSpan(ctx, extract(message))
+	remote, enqueuedAt := extract(message)
+	ctx = chronos.ContextWithRemoteContext(ctx, remote)
+	started := time.Now()
 	_, span := h.client.StartMessagingSpan(ctx, chronos.MessagingSpan{
 		System:        System,
 		Operation:     chronos.OperationProcess,
@@ -297,20 +330,49 @@ func (h *ConsumerGroupHandler) start(
 		Body:          consumeBody(h.client, message.Value),
 		MessageID:     string(message.Key),
 	})
+	// How long the message sat between the publish and this handler. Only the
+	// producer's stamp can supply it, and only when it is there and believable: a
+	// backed-up queue and a slow handler produce the same handler duration and are
+	// told apart by nothing else.
+	if waited, ok := chronos.WaitMilliseconds(enqueuedAt, started); ok {
+		span.SetAttribute("messaging.message.queue_time_ms", itoa(waited))
+	}
 	return span
 }
 
-// extract reads the W3C traceparent a producer wrote, if any.
-func extract(message *sarama.ConsumerMessage) string {
+// extract reads the context a producer wrote: the W3C trio, plus the enqueued-at
+// stamp returned separately because it is a measurement rather than a parent.
+//
+// Case-insensitively keyed, matching PHP's MessagingSpan::inboundContext: Kafka
+// record header keys are raw bytes under whatever case the producer used, and an
+// OTel SDK on the other end is under no obligation to pick ours. A malformed
+// traceparent yields no parent at all, which roots the consume span in its own
+// trace — honest, and better than parenting onto an id nobody can join to.
+func extract(message *sarama.ConsumerMessage) (chronos.RemoteContext, string) {
+	var traceparent, tracestate, baggage, enqueuedAt string
 	for _, header := range message.Headers {
 		if header == nil {
 			continue
 		}
-		if strings.EqualFold(string(header.Key), chronos.TraceparentHeader) {
-			return string(header.Value)
+		value := string(header.Value)
+		switch {
+		case strings.EqualFold(string(header.Key), chronos.TraceparentHeader):
+			traceparent = value
+		case strings.EqualFold(string(header.Key), chronos.TracestateHeader):
+			tracestate = value
+		case strings.EqualFold(string(header.Key), chronos.BaggageHeader):
+			baggage = value
+		case strings.EqualFold(string(header.Key), chronos.EnqueuedAtHeader):
+			enqueuedAt = value
 		}
 	}
-	return ""
+	remote, ok := chronos.ParseTraceparentContext(traceparent)
+	if !ok {
+		return chronos.RemoteContext{}, enqueuedAt
+	}
+	remote.Tracestate = chronos.NormalizeTracestate(tracestate)
+	remote.Baggage = chronos.NormalizeBaggage(baggage)
+	return remote, enqueuedAt
 }
 
 // --- helpers -----------------------------------------------------------------

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"strconv"
-	"time"
 	"unicode/utf8"
 )
 
@@ -211,46 +210,6 @@ func (c *Client) RecordMessaging(
 	}
 	return err
 }
-
-// TraceparentFromContext renders the active span as a W3C traceparent, or "" when
-// there is no span to propagate.
-//
-// This is what makes a consumer span a CHILD of the publish that caused it, across
-// process and language boundaries: the producer writes it as a message header and
-// the consumer parses it back. Chronos's PHP collector reads the same header, so a
-// PHP publisher and a Go consumer land in one trace.
-func TraceparentFromContext(ctx context.Context) string {
-	span := SpanFromContext(ctx)
-	if span == nil {
-		return ""
-	}
-	return span.Traceparent()
-}
-
-// ContextWithRemoteSpan makes an extracted trace context the parent of everything
-// started under the returned context.
-//
-// The returned span is a stub: it is never ended and never recorded, it exists only
-// to carry the remote ids so StartSpan parents onto them. A malformed or absent
-// header returns ctx unchanged, so a consumer that receives an uninstrumented
-// message starts its own trace rather than dropping the message's telemetry.
-func ContextWithRemoteSpan(ctx context.Context, traceparent string) context.Context {
-	traceID, spanID, ok := ParseTraceparent(traceparent)
-	if !ok {
-		return ctx
-	}
-	return context.WithValue(ctx, spanContextKey{}, &Span{
-		TraceID:    traceID,
-		SpanID:     spanID,
-		StartedAt:  time.Now().UTC(),
-		Attributes: map[string]string{},
-		ended:      true,
-	})
-}
-
-// TraceparentHeader is the header name both ends use. W3C, not a Chronos-specific
-// name: a broker header set by any OTel SDK is readable here and vice versa.
-const TraceparentHeader = "traceparent"
 
 func attrInt64(n int64) string {
 	return strconv.FormatInt(n, 10)

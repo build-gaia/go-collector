@@ -32,11 +32,14 @@ func (c *Client) Handler(next http.Handler) http.Handler {
 		ctx := r.Context()
 		name := r.Method + " " + route
 		ctx, span := c.StartSpan(ctx, name)
-		if tp := r.Header.Get("traceparent"); tp != "" {
-			if traceID, parentID, ok := ParseTraceparent(tp); ok {
-				span.TraceID = traceID
-				span.ParentID = parentID
-			}
+		// The inbound context, whole: the ids, the caller's sampling decision, and
+		// the tracestate/baggage this process is obliged to forward to whatever it
+		// calls next. A traceparent we cannot believe leaves the span as the root
+		// of its own trace rather than hanging it off an id nobody minted.
+		if remote, ok := ParseTraceparentContext(r.Header.Get(TraceparentHeader)); ok {
+			remote.Tracestate = NormalizeTracestate(r.Header.Get(TracestateHeader))
+			remote.Baggage = NormalizeBaggage(r.Header.Get(BaggageHeader))
+			span.Adopt(remote)
 		}
 		span.HTTPMethod = r.Method
 		span.HTTPRoute = route
@@ -94,7 +97,7 @@ func (c *Client) Handler(next http.Handler) http.Handler {
 			span.End()
 		}()
 
-		w.Header().Set("traceparent", span.Traceparent())
+		w.Header().Set(TraceparentHeader, span.Traceparent())
 		serve := func(ctx context.Context) {
 			next.ServeHTTP(rw, r.WithContext(ctx))
 		}
@@ -382,7 +385,18 @@ func (t *chronosTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		if tp := span.Traceparent(); tp != "" {
 			// Clone before mutating: the caller owns the request it handed us.
 			req = req.Clone(ctx)
-			req.Header.Set("traceparent", tp)
+			req.Header.Set(TraceparentHeader, tp)
+			// tracestate and baggage ride along unchanged. Forwarding the
+			// traceparent without them is the half-implementation W3C singles out:
+			// another vendor's state silently dies at whichever hop is ours.
+			// Never overwritten with an empty value — a caller that set one
+			// deliberately keeps it.
+			if state := span.Tracestate; state != "" {
+				req.Header.Set(TracestateHeader, state)
+			}
+			if baggage := span.Baggage; baggage != "" {
+				req.Header.Set(BaggageHeader, baggage)
+			}
 		}
 	}
 
