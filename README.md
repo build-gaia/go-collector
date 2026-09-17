@@ -72,6 +72,30 @@ caused it — across processes and across languages, since the PHP collector rea
 the same header. A message without the header starts its own trace rather than
 being dropped.
 
+## AWS (S3, SQS, anything the SDK speaks)
+
+`contrib/awsv2` hooks the aws-sdk-go-v2 middleware stack, so it is wired once per
+process rather than once per call site:
+
+```go
+cfg.APIOptions = append(cfg.APIOptions, chronosaws.Instrument(nil))
+```
+
+Every API call made through that `aws.Config` is then a client span named the way
+OTel names one, `S3.PutObject`, carrying `rpc.system=aws-api`, `rpc.service`,
+`rpc.method`, `cloud.region`, `server.address`, `http.response.status_code`,
+`aws.request_id` and — for S3 — `aws.s3.bucket`, `aws.s3.key` and the
+`aws.extended_request_id` AWS support asks for. Object storage was the last big
+blind spot for Go services: a 2.6 s trace that renders as 36 ms of bars and a lot
+of empty space is S3 time with no span on it.
+
+The span sits above the retryer, so a call the SDK had to try three times is one
+span carrying `aws.request.attempts=3`, not three bars nobody can tell are one call.
+
+Object CONTENTS are never captured, and every address the module writes has its
+query string dropped — a presigned URL puts its credential and signature in
+exactly that query, and a presign runs through the same middleware stack.
+
 For a transport with no wrapper yet, `client.RecordMessaging` / `StartMessagingSpan`
 in the core SDK take the same attributes with no Kafka types involved.
 
@@ -329,9 +353,10 @@ on the mirror with the `go-sdk/` prefix stripped:
 ```sh
 git tag go-sdk/v0.1.0 && git push origin go-sdk/v0.1.0
 git tag go-sdk/contrib/sarama/v0.1.0 && git push origin go-sdk/contrib/sarama/v0.1.0
+git tag go-sdk/contrib/awsv2/v0.1.0 && git push origin go-sdk/contrib/awsv2/v0.1.0
 ```
 
-(The nested contrib module needs its own tag series — that is how Go resolves
+(Each nested contrib module needs its own tag series — that is how Go resolves
 a module in a subdirectory.)
 
 Consumers then require the chronos.dev paths and replace them with the mirror
@@ -341,10 +366,12 @@ Consumers then require the chronos.dev paths and replace them with the mirror
 require (
     chronos.dev/collector/sdk/go v0.0.0
     chronos.dev/collector/sdk/go/contrib/sarama v0.0.0
+    chronos.dev/collector/sdk/go/contrib/awsv2 v0.0.0
 )
 
 replace chronos.dev/collector/sdk/go => github.com/build-gaia/go-collector v0.1.0
 replace chronos.dev/collector/sdk/go/contrib/sarama => github.com/build-gaia/go-collector/contrib/sarama v0.1.0
+replace chronos.dev/collector/sdk/go/contrib/awsv2 => github.com/build-gaia/go-collector/contrib/awsv2 v0.1.0
 ```
 
 (For the nested module Go maps version v0.1.0 to the repo tag
