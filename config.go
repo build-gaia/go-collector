@@ -96,29 +96,34 @@ func LoadConfig() Config {
 		MetricsEnabled:  envBool("CHRONOS_METRICS_ENABLED", true),
 		DSTEnabled:      envBool("CHRONOS_DST_ENABLED", false),
 		// CPU profiling is process-global and exclusive: interval must exceed duration.
-		ProfileInterval:        envDuration("CHRONOS_GO_PROFILE_INTERVAL", 90*time.Second),
-		ProfileDuration:        envDuration("CHRONOS_GO_PROFILE_DURATION", 60*time.Second),
-		MetricsInterval:        envDuration("CHRONOS_GO_METRICS_INTERVAL", 15*time.Second),
-		ProfileMaxStackDepth:   envInt("CHRONOS_GO_PROFILE_MAX_STACK_DEPTH", 64),
-		ProfileBatchSize:       envInt("CHRONOS_GO_PROFILE_BATCH_SIZE", defaultProfileBatchSize),
-		WallProfileEnabled:     envBool("CHRONOS_GO_WALL_ENABLED", true),
-		WallSampleInterval:     envDuration("CHRONOS_GO_WALL_INTERVAL", 100*time.Millisecond),
-		WallExcludeIdle:        envBool("CHRONOS_GO_WALL_EXCLUDE_IDLE", true),
-		WallMaxStacks:          envInt("CHRONOS_GO_WALL_MAX_STACKS", 4096),
-		IOProfileEnabled:       envBool("CHRONOS_GO_IO_ENABLED", true),
-		IOMinWait:              envDuration("CHRONOS_GO_IO_MIN_WAIT", time.Millisecond),
-		IOMaxSamples:           envInt("CHRONOS_GO_IO_MAX_SAMPLES", 4096),
-		SpanBatchSize:          envInt("CHRONOS_GO_SPAN_BATCH_SIZE", defaultSpanBatchSize),
-		SpanFlushInterval:      envDuration("CHRONOS_GO_SPAN_FLUSH_INTERVAL", defaultSpanFlushInterval),
-		SpanMaxBuffered:        envInt("CHRONOS_GO_SPAN_MAX_BUFFERED", 10000),
-		HTTPCapture:            envBool("CHRONOS_GO_HTTP_CAPTURE", true),
-		HTTPCaptureBodies:      envBool("CHRONOS_GO_HTTP_CAPTURE_BODIES", true),
-		HTTPMaxBody:            envInt("CHRONOS_GO_HTTP_CAPTURE_MAX_BODY", 65536),
-		HTTPRedact:             envBool("CHRONOS_GO_HTTP_CAPTURE_REDACT", true),
-		MessagingCaptureBodies: envBool("CHRONOS_GO_MESSAGING_CAPTURE_BODIES", true),
-		MessagingMaxBody:       envInt("CHRONOS_GO_MESSAGING_CAPTURE_MAX_BODY", 0),
-		RedactPatterns:         envCSV("CHRONOS_GO_REDACT_PATTERNS", defaultRedactPatterns),
-		HTTPSkipPaths:          envCSV("CHRONOS_GO_HTTP_SKIP_PATHS", defaultHTTPSkipPaths),
+		ProfileInterval:      envDuration("CHRONOS_GO_PROFILE_INTERVAL", 90*time.Second),
+		ProfileDuration:      envDuration("CHRONOS_GO_PROFILE_DURATION", 60*time.Second),
+		MetricsInterval:      envDuration("CHRONOS_GO_METRICS_INTERVAL", 15*time.Second),
+		ProfileMaxStackDepth: envInt("CHRONOS_GO_PROFILE_MAX_STACK_DEPTH", 64),
+		ProfileBatchSize:     envInt("CHRONOS_GO_PROFILE_BATCH_SIZE", defaultProfileBatchSize),
+		WallProfileEnabled:   envBool("CHRONOS_GO_WALL_ENABLED", true),
+		WallSampleInterval:   envDuration("CHRONOS_GO_WALL_INTERVAL", 100*time.Millisecond),
+		WallExcludeIdle:      envBool("CHRONOS_GO_WALL_EXCLUDE_IDLE", true),
+		WallMaxStacks:        envInt("CHRONOS_GO_WALL_MAX_STACKS", 4096),
+		IOProfileEnabled:     envBool("CHRONOS_GO_IO_ENABLED", true),
+		IOMinWait:            envDuration("CHRONOS_GO_IO_MIN_WAIT", time.Millisecond),
+		IOMaxSamples:         envInt("CHRONOS_GO_IO_MAX_SAMPLES", 4096),
+		SpanBatchSize:        envInt("CHRONOS_GO_SPAN_BATCH_SIZE", defaultSpanBatchSize),
+		SpanFlushInterval:    envDuration("CHRONOS_GO_SPAN_FLUSH_INTERVAL", defaultSpanFlushInterval),
+		SpanMaxBuffered:      envInt("CHRONOS_GO_SPAN_MAX_BUFFERED", 10000),
+		// What gets captured and redacted is Chronos behaviour, not Go
+		// behaviour: an operator deciding "no payloads on this service" means
+		// the same thing whatever the service is written in. These keys are
+		// unprefixed so one policy reads the same across the estate. The
+		// CHRONOS_GO_* spellings still work and are deprecated.
+		HTTPCapture:            envBoolCompat("CHRONOS_HTTP_CAPTURE", "CHRONOS_GO_HTTP_CAPTURE", true),
+		HTTPCaptureBodies:      envBoolCompat("CHRONOS_HTTP_CAPTURE_BODIES", "CHRONOS_GO_HTTP_CAPTURE_BODIES", true),
+		HTTPMaxBody:            envIntCompat("CHRONOS_HTTP_CAPTURE_MAX_BODY", "CHRONOS_GO_HTTP_CAPTURE_MAX_BODY", 65536),
+		HTTPRedact:             envBoolCompat("CHRONOS_HTTP_CAPTURE_REDACT", "CHRONOS_GO_HTTP_CAPTURE_REDACT", true),
+		MessagingCaptureBodies: envBoolCompat("CHRONOS_MESSAGING_CAPTURE_BODIES", "CHRONOS_GO_MESSAGING_CAPTURE_BODIES", true),
+		MessagingMaxBody:       envIntCompat("CHRONOS_MESSAGING_CAPTURE_MAX_BODY", "CHRONOS_GO_MESSAGING_CAPTURE_MAX_BODY", 0),
+		RedactPatterns:         envCSVCompat("CHRONOS_REDACT_PATTERNS", "CHRONOS_GO_REDACT_PATTERNS", defaultRedactPatterns),
+		HTTPSkipPaths:          envCSVCompat("CHRONOS_HTTP_SKIP_PATHS", "CHRONOS_GO_HTTP_SKIP_PATHS", defaultHTTPSkipPaths),
 	}
 	if !cfg.Enabled || cfg.Organisation == "" || cfg.Project == "" || cfg.Application == "" || cfg.SpoolDir == "" {
 		cfg.Enabled = false
@@ -157,6 +162,31 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// The *Compat helpers read the estate-wide key first and fall back to the
+// language-prefixed one. Prefer CHRONOS_GO_* only for settings that are
+// genuinely Go-specific -- profiling cadence, goroutine and span buffering --
+// where no other runtime has an equivalent to keep in step.
+func envBoolCompat(key, deprecated string, fallback bool) bool {
+	if strings.TrimSpace(os.Getenv(key)) != "" {
+		return envBool(key, fallback)
+	}
+	return envBool(deprecated, fallback)
+}
+
+func envIntCompat(key, deprecated string, fallback int) int {
+	if strings.TrimSpace(os.Getenv(key)) != "" {
+		return envInt(key, fallback)
+	}
+	return envInt(deprecated, fallback)
+}
+
+func envCSVCompat(key, deprecated string, fallback []string) []string {
+	if strings.TrimSpace(os.Getenv(key)) != "" {
+		return envCSV(key, fallback)
+	}
+	return envCSV(deprecated, fallback)
 }
 
 func envBool(key string, fallback bool) bool {
