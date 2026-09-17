@@ -99,3 +99,27 @@ func TestMessagingCaptureBodiesDefaultOn(t *testing.T) {
 	require.True(t, cfg.HTTPCaptureBodies)
 	require.True(t, cfg.MessagingCaptureBodies)
 }
+
+// The kind a messaging span wears is a cross-language contract, not a local
+// preference: a Go publish and a PHP publish to the same topic must sort the
+// same way in the waterfall and on the service map. This drifted once — Go said
+// `client` where PHP said `producer` — and nothing caught it, because nothing
+// asserted it.
+func TestMessagingSpanKindMatchesTheNormalisedContract(t *testing.T) {
+	client := messagingClient(t, true, 0)
+	defer client.Shutdown(context.Background())
+
+	for operation, want := range map[string]string{
+		chronos.OperationPublish: "producer",
+		chronos.OperationProcess: "consumer",
+		chronos.OperationReceive: "consumer",
+	} {
+		_, span := client.StartMessagingSpan(context.Background(), chronos.MessagingSpan{
+			System:      "kafka",
+			Operation:   operation,
+			Destination: "orders",
+		})
+		require.Equal(t, want, span.Attributes["span.kind"],
+			"operation %q must be span.kind %q", operation, want)
+	}
+}

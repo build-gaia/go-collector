@@ -181,12 +181,19 @@ func messagingText(bytes []byte) (string, bool) {
 	return string(bytes), true
 }
 
-// A publish is a client call; a receive or process is server-side work. The same
-// distinction span.kind already carries for HTTP, and what lets a consumer span be
-// the root of its own trace without looking like an outbound request.
+// A publish is `producer` and a receive or process is `consumer` — the OTel
+// messaging spellings, and the same pair the PHP collector emits.
+//
+// This used to say `client`, reasoning that a publish is an outbound call like
+// any other. That reads sensibly in isolation and is wrong across the estate: a
+// Go publish and a PHP publish to the SAME topic then disagreed about what kind
+// of span they were, so anything classifying by kind — the waterfall's lanes,
+// the service map's producer and consumer marks — sorted one hop two ways
+// depending on which language happened to write it. One vocabulary per fact is
+// the whole point of the normalised surface, and `client` was a second one.
 func spanKindFor(operation string) string {
 	if operation == OperationPublish {
-		return "client"
+		return "producer"
 	}
 	return "consumer"
 }
